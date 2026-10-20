@@ -569,6 +569,24 @@ const char* LiGetStageName(int stage);
 // This function may only be called between LiStartConnection() and LiStopConnection().
 bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance);
 
+// Private receipt-ACK extension. Times use the client's LiGetMicroseconds() clock.
+// The measured delay includes the return path; it does not measure game response.
+// A successful query with sampleCount == 0 means no event has been acknowledged yet.
+typedef struct _LI_MOUSE_ACK_STATS {
+    uint64_t sampleCount;
+    uint64_t lastDelayUs;
+    uint64_t lastAckTimeUs;
+} LI_MOUSE_ACK_STATS;
+
+// Only call during an active stream. Returns false if the host lacks the extension.
+bool LiGetMouseAckStats(bool motion, LI_MOUSE_ACK_STATS* stats);
+
+// Timestamped versions of the mouse APIs, using LiGetMicroseconds() units.
+// Pass the time of the oldest event included in a motion batch.
+int LiSendMouseMoveEventWithTimestamp(short deltaX, short deltaY, uint64_t timestampUs);
+int LiSendMousePositionEventWithTimestamp(short x, short y, short referenceWidth, short referenceHeight, uint64_t timestampUs);
+int LiSendMouseButtonEventWithTimestamp(char action, int button, uint64_t timestampUs);
+
 // This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
 

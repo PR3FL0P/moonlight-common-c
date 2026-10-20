@@ -1146,6 +1146,11 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             SunshineFeatureFlags = 0;
         }
 
+        if (!parseSdpAttributeToUInt(response.payload, "x-ss-input-latency", &InputLatencyProtocol) ||
+                !IS_SUNSHINE() || InputLatencyProtocol != 1) {
+            InputLatencyProtocol = 0;
+        }
+
         // Look for the Sunshine encryption flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionSupported", &EncryptionFeaturesSupported)) {
             EncryptionFeaturesSupported = 0;

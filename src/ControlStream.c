@@ -127,6 +127,48 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define CONN_OKAY_LOSS_RATE 5
 #define CONN_STATUS_SAMPLE_PERIOD 3000
 
+static LI_MOUSE_ACK_STATS mouseAckStats[2];
+
+bool LiGetMouseAckStats(bool motion, LI_MOUSE_ACK_STATS* stats) {
+    if (InputLatencyProtocol != 1) {
+        return false;
+    }
+    PltLockMutex(&enetMutex);
+    *stats = mouseAckStats[motion ? 1 : 0];
+    PltUnlockMutex(&enetMutex);
+    return true;
+}
+
+// ACK payload: event timestamp (LE64), original input magic (LE32).
+static void handleMouseReceiptAck(const void* payload, int length) {
+    uint64_t timestamp;
+    uint32_t magic;
+    if (InputLatencyProtocol != 1 || length != 12) {
+        return;
+    }
+    memcpy(&timestamp, payload, sizeof(timestamp));
+    memcpy(&magic, (const char*)payload + sizeof(timestamp), sizeof(magic));
+    timestamp = LE64(timestamp);
+    magic = LE32(magic);
+    bool motion = magic == MOUSE_MOVE_REL_MAGIC_GEN5 || magic == MOUSE_MOVE_ABS_MAGIC;
+    if (!motion && magic != MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5 && magic != MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5) {
+        return;
+    }
+    uint64_t now = LiGetMicroseconds();
+    if (timestamp == 0 || timestamp > now) {
+        return;
+    }
+    PltLockMutex(&enetMutex);
+    LI_MOUSE_ACK_STATS* stats = &mouseAckStats[motion ? 1 : 0];
+    // A slow retransmission must not replace a newer sample.
+    if (stats->sampleCount == 0 || timestamp >= stats->lastAckTimeUs - stats->lastDelayUs) {
+        stats->sampleCount++;
+        stats->lastDelayUs = now - timestamp;
+        stats->lastAckTimeUs = now;
+    }
+    PltUnlockMutex(&enetMutex);
+}
+
 #define IDX_START_A 0
 #define IDX_REQUEST_IDR_FRAME 0
 #define IDX_START_B 1
@@ -299,6 +341,7 @@ static bool supportsIdrFrameRequest;
 
 // Initializes the control stream
 int initializeControlStream(void) {
+    memset(mouseAckStats, 0, sizeof(mouseAckStats));
     stopping = false;
     PltCreateEvent(&idrFrameRequiredEvent);
     LbqInitializeLinkedBlockingQueue(&referenceFrameControlQueue, 20);
@@ -1293,7 +1336,10 @@ static void controlReceiveThreadFunc(void* context) {
             }
 
             // Process client callbacks in a separate thread
-            if (needsAsyncCallback(ctlHdr->type)) {
+            if (ctlHdr->type == SS_INPUT_LATENCY_ACK) {
+                handleMouseReceiptAck(ctlHdr + 1, packetLength - sizeof(*ctlHdr));
+            }
+            else if (needsAsyncCallback(ctlHdr->type)) {
                 queueAsyncCallback(ctlHdr, packetLength);
             }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {

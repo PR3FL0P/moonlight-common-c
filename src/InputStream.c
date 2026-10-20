@@ -5,6 +5,7 @@ static unsigned char currentAesIv[16];
 static bool initialized;
 static bool encryptedControlStream;
 static bool needsBatchedScroll;
+static uint64_t lastMouseLatencySampleUs;
 static int batchedScrollDelta;
 static PPLT_CRYPTO_CONTEXT cryptoContext;
 
@@ -51,6 +52,7 @@ typedef struct _PACKET_HOLDER {
     LINKED_BLOCKING_QUEUE_ENTRY entry;
     uint32_t enetPacketFlags;
     uint8_t channelId;
+    uint64_t timestampUs; // Oldest mouse event represented by this holder
 
     // The union must be the last member since we abuse the NV_UNICODE_PACKET
     // text field to store variable length data which gets split before being
@@ -94,6 +96,7 @@ static struct {
 
 // Initializes the input stream
 int initializeInputStream(void) {
+    lastMouseLatencySampleUs = 0;
     memcpy(currentAesIv, StreamConfig.remoteInputAesIv, sizeof(currentAesIv));
 
     // Set a high maximum queue size limit to ensure input isn't dropped
@@ -235,12 +238,43 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
 static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
     SOCK_RET err;
 
+    unsigned char wrappedPacket[MAX_INPUT_PACKET_SIZE];
+    unsigned char* packetData = (unsigned char*)&holder->packet;
+    int packetSize = PACKET_SIZE(holder);
+    uint32_t magic = LE32(holder->packet.header.magic);
+    bool motion = magic == MOUSE_MOVE_REL_MAGIC_GEN5 || magic == MOUSE_MOVE_ABS_MAGIC;
+    bool button = magic == MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5 || magic == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
+    uint64_t nowUs = LiGetMicroseconds();
+
+    // Every button transition is sampled. Motion is sampled at most 10 times/sec.
+    // Stock hosts receive exactly the original packets, without any extra traffic.
+    if (InputLatencyProtocol == 1 && encryptedControlStream && (motion || button) &&
+            holder->timestampUs != 0 && (!motion || nowUs - lastMouseLatencySampleUs >= 100000)) {
+        NV_INPUT_HEADER header;
+        uint64_t timestampLE = LE64(holder->timestampUs);
+        int prefixSize = sizeof(header) + sizeof(timestampLE);
+        LC_ASSERT(prefixSize + packetSize <= sizeof(wrappedPacket));
+        header.size = BE32(prefixSize + packetSize - sizeof(header.size));
+        header.magic = LE32(SS_INPUT_LATENCY_MAGIC);
+        memcpy(wrappedPacket, &header, sizeof(header));
+        memcpy(wrappedPacket + sizeof(header), &timestampLE, sizeof(timestampLE));
+        memcpy(wrappedPacket + prefixSize, packetData, packetSize);
+        packetData = wrappedPacket;
+        packetSize += prefixSize;
+        holder->timestampUs = 0;
+        if (motion) {
+            lastMouseLatencySampleUs = nowUs;
+        }
+        // Send sampled input immediately rather than waiting for unrelated data.
+        moreData = false;
+    }
+
     // On GFE 3.22, the entire control stream is encrypted (and support for separate RI encrypted)
     // has been removed. We send the plaintext packet through and the control stream code will do
     // the encryption.
     if (encryptedControlStream) {
-        err = (SOCK_RET)sendInputPacketOnControlStream((unsigned char*)&holder->packet,
-                                                        PACKET_SIZE(holder),
+        err = (SOCK_RET)sendInputPacketOnControlStream(packetData,
+                                                        packetSize,
                                                         holder->channelId,
                                                         holder->enetPacketFlags,
                                                         moreData);
@@ -705,6 +739,10 @@ int stopInputStream(void) {
 
 // Send a mouse move event to the streaming machine
 int LiSendMouseMoveEvent(short deltaX, short deltaY) {
+    return LiSendMouseMoveEventWithTimestamp(deltaX, deltaY, LiGetMicroseconds());
+}
+
+int LiSendMouseMoveEventWithTimestamp(short deltaX, short deltaY, uint64_t timestampUs) {
     PPACKET_HOLDER holder;
     int err;
 
@@ -741,6 +779,8 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
         // and protocol updates to allow us to determine which unreliable messages were dropped.
         holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
+        holder->timestampUs = timestampUs;
+
         holder->packet.mouseMoveRel.header.size = BE32(sizeof(NV_REL_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
         if (AppVersionQuad[0] >= 5) {
             holder->packet.mouseMoveRel.header.magic = LE32(MOUSE_MOVE_REL_MAGIC_GEN5);
@@ -772,6 +812,10 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
 
 // Send a mouse position update to the streaming machine
 int LiSendMousePositionEvent(short x, short y, short referenceWidth, short referenceHeight) {
+    return LiSendMousePositionEventWithTimestamp(x, y, referenceWidth, referenceHeight, LiGetMicroseconds());
+}
+
+int LiSendMousePositionEventWithTimestamp(short x, short y, short referenceWidth, short referenceHeight, uint64_t timestampUs) {
     PPACKET_HOLDER holder;
     int err;
 
@@ -804,6 +848,8 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
 
         // TODO: Send this as unreliable sequenced when we have a delayed reliable retransmission thread
         holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
+
+        holder->timestampUs = timestampUs;
 
         holder->packet.mouseMoveAbs.header.size = BE32(sizeof(NV_ABS_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
         holder->packet.mouseMoveAbs.header.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
@@ -850,6 +896,10 @@ int LiSendMouseMoveAsMousePositionEvent(short deltaX, short deltaY, short refere
 
 // Send a mouse button event to the streaming machine
 int LiSendMouseButtonEvent(char action, int button) {
+    return LiSendMouseButtonEventWithTimestamp(action, button, LiGetMicroseconds());
+}
+
+int LiSendMouseButtonEventWithTimestamp(char action, int button, uint64_t timestampUs) {
     PPACKET_HOLDER holder;
     int err;
 
@@ -864,6 +914,8 @@ int LiSendMouseButtonEvent(char action, int button) {
 
     holder->channelId = CTRL_CHANNEL_MOUSE;
     holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
+    holder->timestampUs = timestampUs;
+
     holder->packet.mouseButton.header.size = BE32(sizeof(NV_MOUSE_BUTTON_PACKET) - sizeof(uint32_t));
     holder->packet.mouseButton.header.magic = (uint8_t)action;
     if (AppVersionQuad[0] >= 5) {

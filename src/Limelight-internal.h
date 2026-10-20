@@ -43,6 +43,11 @@ extern SS_PING VideoPingPayload;
 extern uint32_t ControlConnectData;
 
 extern uint32_t SunshineFeatureFlags;
+extern uint32_t InputLatencyProtocol;
+
+// Private, versioned extension negotiated through x-ss-input-latency:1.
+#define SS_INPUT_LATENCY_MAGIC 0x550000F0
+#define SS_INPUT_LATENCY_ACK 0x55F0
 
 // Encryption flags shared by Sunshine and Moonlight in RTSP
 #define SS_ENC_CONTROL_V2 0x01
